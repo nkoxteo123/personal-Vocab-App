@@ -214,81 +214,106 @@ function chunkText(text: string, maxChars = 2000): string[] {
   return result.filter(Boolean);
 }
 
-const VOCAB_PROMPT = (text: string) =>
-`You are an expert English language teacher. From the text below, extract ALL meaningful vocabulary words and phrases.
+// ─── Two-pass vocabulary extraction ──────────────────────────
+// Pass 1: Extract just the word list (compact — fits 100+ words easily)
+// Pass 2: Enrich batches of words with full details
 
-Include ALL types:
-- Nouns, verbs, adjectives, adverbs
-- Phrasal verbs (e.g. "wade through", "carry out")
-- Idioms and fixed expressions
-- Collocations (e.g. "prompt attention", "rushed answer")
-- Technical/domain-specific terms
+const WORD_LIST_PROMPT = (text: string) =>
+`You are an expert English teacher. From the text below, list ALL meaningful English vocabulary words and phrases.
 
-Extract as many words as possible. Include words of ALL CEFR levels (A1 to C2), not only difficult ones.
-Return ONLY a JSON array, no other text:
-[{"word": "", "pos": "noun|verb|adj|adv|phrasal verb|phrase|idiom", "cefr": "A1|A2|B1|B2|C1|C2", "phonetic": "", "meaning_vi": "", "meaning_en": "", "context_in_text": "", "context_real_world": "", "collocations": [], "synonyms": [], "antonyms": [], "word_family": [], "related_words": [], "example_from_text": "", "example_real": "", "tags": []}]
+Include: nouns, verbs, adjectives, adverbs, phrasal verbs, idioms, collocations, technical terms.
+Include ALL CEFR levels (A1 to C2), not only difficult ones. Be thorough — extract as many as possible.
+
+Return ONLY a JSON array of strings, nothing else. Example: ["word1", "carry out", "word3"]
 
 Text:
 ${text}`;
 
+const ENRICH_PROMPT = (words: string[], text: string) =>
+`You are an expert English teacher. For each word below, provide full details based on the source text.
+
+Words to enrich: ${JSON.stringify(words)}
+
+Source text (for context): ${text.slice(0, 1500)}
+
+Return ONLY a JSON array with one object per word, no other text:
+[{"word": "", "pos": "noun|verb|adj|adv|phrasal verb|phrase|idiom", "cefr": "A1|A2|B1|B2|C1|C2", "phonetic": "", "meaning_vi": "", "meaning_en": "", "context_in_text": "", "context_real_world": "", "collocations": [], "synonyms": [], "antonyms": [], "word_family": [], "related_words": [], "example_from_text": "", "example_real": "", "tags": []}]`;
+
+function parseJsonArray(raw: string): unknown[] {
+  try {
+    const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+    const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+    if (jsonMatch) return JSON.parse(jsonMatch[0]);
+  } catch { /* ignore */ }
+  // fallback: extract individual objects
+  const objectRegex = /\{[^{}]*"word"\s*:[^{}]*\}/g;
+  const matches = raw.match(objectRegex);
+  if (matches) {
+    return matches.map((m) => { try { return JSON.parse(m); } catch { return null; } }).filter(Boolean);
+  }
+  return [];
+}
+
 export async function extractVocabulary(text: string): Promise<string> {
-  const chunks = chunkText(text, 2000);
+  // Pass 1: Get word list (compact output — easily 50-100+ words)
+  emitStatus({ state: 'pending', message: 'Step 1/2: Identifying vocabulary...', timestamp: Date.now() });
 
-  if (chunks.length === 1) {
-    emitStatus({ state: 'pending', message: 'Extracting vocabulary...', timestamp: Date.now() });
-    return callGemini(VOCAB_PROMPT(text), undefined, 8192);
-  }
+  const chunks = chunkText(text, 3000);
+  const allWords = new Set<string>();
 
-  // Multiple chunks — process sequentially and merge JSON arrays
-  const allResults: string[] = [];
   for (let i = 0; i < chunks.length; i++) {
-    emitStatus({
-      state: 'pending',
-      message: `Extracting vocabulary (chunk ${i + 1}/${chunks.length})...`,
-      timestamp: Date.now(),
-    });
-    const result = await callGemini(VOCAB_PROMPT(chunks[i]), undefined, 8192);
-    allResults.push(result);
-  }
-
-  // Merge all JSON arrays into one
-  const merged: unknown[] = [];
-  const seenWords = new Set<string>();
-
-  for (const raw of allResults) {
+    if (chunks.length > 1) {
+      emitStatus({ state: 'pending', message: `Step 1/2: Scanning text (${i + 1}/${chunks.length})...`, timestamp: Date.now() });
+    }
+    const listRaw = await callGemini(WORD_LIST_PROMPT(chunks[i]), undefined, 4096);
     try {
-      const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
-      const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
-      if (jsonMatch) {
-        const arr = JSON.parse(jsonMatch[0]);
-        for (const item of arr) {
-          const key = String(item.word || '').toLowerCase().trim();
-          if (key && !seenWords.has(key)) {
-            seenWords.add(key);
-            merged.push(item);
-          }
-        }
+      const cleaned = listRaw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+      const match = cleaned.match(/\[[\s\S]*\]/);
+      if (match) {
+        const arr = JSON.parse(match[0]) as string[];
+        arr.forEach((w) => allWords.add(String(w).toLowerCase().trim()));
       }
     } catch {
-      // fallback: extract individual objects
-      const objectRegex = /\{[^{}]*"word"\s*:[^{}]*\}/g;
-      const matches = raw.match(objectRegex);
-      if (matches) {
-        for (const m of matches) {
-          try {
-            const item = JSON.parse(m);
-            const key = String(item.word || '').toLowerCase().trim();
-            if (key && !seenWords.has(key)) {
-              seenWords.add(key);
-              merged.push(item);
-            }
-          } catch { /* skip */ }
-        }
-      }
+      // try to extract quoted strings
+      const quoted = listRaw.match(/"([^"]+)"/g);
+      if (quoted) quoted.forEach((q) => allWords.add(q.replace(/"/g, '').toLowerCase().trim()));
     }
   }
 
-  return JSON.stringify(merged);
+  if (allWords.size === 0) {
+    throw new Error('AI could not identify any vocabulary from the text.');
+  }
+
+  // Pass 2: Enrich in batches of 25
+  const wordArray = [...allWords];
+  const batchSize = 25;
+  const batches = [];
+  for (let i = 0; i < wordArray.length; i += batchSize) {
+    batches.push(wordArray.slice(i, i + batchSize));
+  }
+
+  const allEnriched: unknown[] = [];
+  for (let i = 0; i < batches.length; i++) {
+    emitStatus({
+      state: 'pending',
+      message: `Step 2/2: Enriching words (${Math.min((i + 1) * batchSize, wordArray.length)}/${wordArray.length})...`,
+      timestamp: Date.now(),
+    });
+    const enrichRaw = await callGemini(ENRICH_PROMPT(batches[i], text), undefined, 8192);
+    const parsed = parseJsonArray(enrichRaw);
+    allEnriched.push(...parsed);
+  }
+
+  // Deduplicate by word
+  const seen = new Set<string>();
+  const deduped = allEnriched.filter((item: any) => {
+    const key = String(item.word || '').toLowerCase().trim();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return JSON.stringify(deduped);
 }
 
 export async function extractSingleWord(word: string, context: string): Promise<string> {
