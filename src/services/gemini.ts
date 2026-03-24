@@ -155,9 +155,27 @@ export async function callGemini(
 
 // ─── Prompt functions (unchanged) ────────────────────────────
 
-export async function extractVocabulary(text: string): Promise<string> {
-  emitStatus({ state: 'pending', message: 'Extracting vocabulary...', timestamp: Date.now() });
-  return callGemini(
+function chunkText(text: string, maxChars = 2000): string[] {
+  if (text.length <= maxChars) return [text];
+
+  const chunks: string[] = [];
+  const paragraphs = text.split(/\n\s*\n/);
+  let current = '';
+
+  for (const para of paragraphs) {
+    if (current.length + para.length + 2 > maxChars && current.length > 0) {
+      chunks.push(current.trim());
+      current = para;
+    } else {
+      current += (current ? '\n\n' : '') + para;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  return chunks;
+}
+
+const VOCAB_PROMPT = (text: string) =>
 `You are an expert English language teacher. From the text below, extract ALL meaningful vocabulary words and phrases.
 
 Include ALL types:
@@ -167,13 +185,71 @@ Include ALL types:
 - Collocations (e.g. "prompt attention", "rushed answer")
 - Technical/domain-specific terms
 
-Extract up to 200 words. Include words of ALL CEFR levels (A1 to C2), not only difficult ones. Try to extract as much meaningful vocabulary as possible.
+Extract as many words as possible. Include words of ALL CEFR levels (A1 to C2), not only difficult ones.
 Return ONLY a JSON array, no other text:
 [{"word": "", "pos": "noun|verb|adj|adv|phrasal verb|phrase|idiom", "cefr": "A1|A2|B1|B2|C1|C2", "phonetic": "", "meaning_vi": "", "meaning_en": "", "context_in_text": "", "context_real_world": "", "collocations": [], "synonyms": [], "antonyms": [], "word_family": [], "related_words": [], "example_from_text": "", "example_real": "", "tags": []}]
 
 Text:
-${text}`
-  );
+${text}`;
+
+export async function extractVocabulary(text: string): Promise<string> {
+  const chunks = chunkText(text, 2000);
+
+  if (chunks.length === 1) {
+    emitStatus({ state: 'pending', message: 'Extracting vocabulary...', timestamp: Date.now() });
+    return callGemini(VOCAB_PROMPT(text), undefined, 8192);
+  }
+
+  // Multiple chunks — process sequentially and merge JSON arrays
+  const allResults: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    emitStatus({
+      state: 'pending',
+      message: `Extracting vocabulary (chunk ${i + 1}/${chunks.length})...`,
+      timestamp: Date.now(),
+    });
+    const result = await callGemini(VOCAB_PROMPT(chunks[i]), undefined, 8192);
+    allResults.push(result);
+  }
+
+  // Merge all JSON arrays into one
+  const merged: unknown[] = [];
+  const seenWords = new Set<string>();
+
+  for (const raw of allResults) {
+    try {
+      const cleaned = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+      const jsonMatch = cleaned.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const arr = JSON.parse(jsonMatch[0]);
+        for (const item of arr) {
+          const key = String(item.word || '').toLowerCase().trim();
+          if (key && !seenWords.has(key)) {
+            seenWords.add(key);
+            merged.push(item);
+          }
+        }
+      }
+    } catch {
+      // fallback: extract individual objects
+      const objectRegex = /\{[^{}]*"word"\s*:[^{}]*\}/g;
+      const matches = raw.match(objectRegex);
+      if (matches) {
+        for (const m of matches) {
+          try {
+            const item = JSON.parse(m);
+            const key = String(item.word || '').toLowerCase().trim();
+            if (key && !seenWords.has(key)) {
+              seenWords.add(key);
+              merged.push(item);
+            }
+          } catch { /* skip */ }
+        }
+      }
+    }
+  }
+
+  return JSON.stringify(merged);
 }
 
 export async function extractSingleWord(word: string, context: string): Promise<string> {
