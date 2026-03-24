@@ -155,11 +155,41 @@ export async function callGemini(
 
 // ─── Prompt functions (unchanged) ────────────────────────────
 
+function splitBySentences(text: string, maxChars: number): string[] {
+  const sentences = text.match(/[^.!?]+[.!?]+[\s]*/g) || [text];
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const sentence of sentences) {
+    if (current.length + sentence.length > maxChars && current.length > 0) {
+      chunks.push(current.trim());
+      current = sentence;
+    } else {
+      current += sentence;
+    }
+  }
+  if (current.trim()) chunks.push(current.trim());
+
+  // If a chunk is still too large (no sentence boundaries found), force-split by character
+  const result: string[] = [];
+  for (const chunk of chunks) {
+    if (chunk.length <= maxChars) {
+      result.push(chunk);
+    } else {
+      for (let i = 0; i < chunk.length; i += maxChars) {
+        result.push(chunk.slice(i, i + maxChars).trim());
+      }
+    }
+  }
+  return result.filter(Boolean);
+}
+
 function chunkText(text: string, maxChars = 2000): string[] {
   if (text.length <= maxChars) return [text];
 
-  const chunks: string[] = [];
+  // First try splitting by paragraphs
   const paragraphs = text.split(/\n\s*\n/);
+  const chunks: string[] = [];
   let current = '';
 
   for (const para of paragraphs) {
@@ -172,7 +202,16 @@ function chunkText(text: string, maxChars = 2000): string[] {
   }
   if (current.trim()) chunks.push(current.trim());
 
-  return chunks;
+  // If any chunk is still too large, split it further by sentences
+  const result: string[] = [];
+  for (const chunk of chunks) {
+    if (chunk.length <= maxChars) {
+      result.push(chunk);
+    } else {
+      result.push(...splitBySentences(chunk, maxChars));
+    }
+  }
+  return result.filter(Boolean);
 }
 
 const VOCAB_PROMPT = (text: string) =>
